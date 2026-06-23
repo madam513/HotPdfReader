@@ -1,0 +1,137 @@
+name: Release macOS
+
+on:
+  push:
+    tags:
+      - "v*"
+
+jobs:
+  build-sign:
+    name: Build and Sign macOS App
+    runs-on: macos-latest
+
+    permissions:
+      contents: write
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Download unsigned app zip from release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          mkdir -p dist
+
+          gh release download "${{ github.ref_name }}" \
+            --repo "${{ github.repository }}" \
+            --pattern "*unsigned*.zip" \
+            --dir dist
+
+          ls -la dist
+
+      - name: Unzip app
+        run: |
+          mkdir -p unsigned
+          unzip dist/*unsigned*.zip -d unsigned
+          find unsigned -name "*.app" -type d
+
+      - name: Import Apple certificate
+        env:
+          APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
+          APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
+        run: |
+          echo "$APPLE_CERTIFICATE" | base64 --decode > certificate.p12
+
+          security create-keychain -p "" build.keychain
+          security default-keychain -s build.keychain
+          security unlock-keychain -p "" build.keychain
+
+          security import certificate.p12 \
+            -k build.keychain \
+            -P "$APPLE_CERTIFICATE_PASSWORD" \
+            -T /usr/bin/codesign
+
+          security set-key-partition-list \
+            -S apple-tool:,apple:,codesign: \
+            -s -k "" build.keychain
+
+      - name: Sign app
+        env:
+          APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
+        run: |
+          APP_PATH="$(find unsigned -name "*.app" -type d | head -n 1)"
+
+          if [ -z "$APP_PATH" ]; then
+            echo "No .app found"
+            exit 1
+          fi
+
+          codesign --force --deep --options runtime \
+            --timestamp \
+            --sign "$APPLE_SIGNING_IDENTITY" \
+            "$APP_PATH"
+
+          codesign --verify --deep --strict --verbose=2 "$APP_PATH"
+
+          mkdir -p signed
+          ditto "$APP_PATH" "signed/$(basename "$APP_PATH")"
+
+      - name: Upload signed app artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: signed-macos-artifacts
+          path: signed/*.app
+          if-no-files-found: error
+
+  notarize-release:
+    name: Notarize and Release macOS App
+    needs: build-sign
+    runs-on: macos-latest
+
+    permissions:
+      contents: write
+
+    steps:
+      - name: Download signed app
+        uses: actions/download-artifact@v4
+        with:
+          name: signed-macos-artifacts
+          path: artifacts
+
+      - name: Prepare app for notarization
+        run: |
+          APP_PATH="$(find artifacts -name "*.app" -type d | head -n 1)"
+
+          if [ -z "$APP_PATH" ]; then
+            echo "No .app found"
+            exit 1
+          fi
+
+          echo "APP_PATH=$APP_PATH" >> "$GITHUB_ENV"
+
+          ditto -c -k --keepParent "$APP_PATH" app-notarize.zip
+
+      - name: Notarize app
+        env:
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_PASSWORD: ${{ secrets.APPLE_PASSWORD }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+        run: |
+          xcrun notarytool submit app-notarize.zip \
+            --apple-id "$APPLE_ID" \
+            --team-id "$APPLE_TEAM_ID" \
+            --password "$APPLE_PASSWORD" \
+            --wait
+
+          xcrun stapler staple "$APP_PATH"
+          xcrun stapler validate "$APP_PATH"
+
+      - name: Create final app zip
+        run: |
+          ditto -c -k --keepParent "$APP_PATH" "HotPdfReader-macOS.app.zip"
+
+      - name: Upload notarized app to GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: HotPdfReader-macOS.app.zip
