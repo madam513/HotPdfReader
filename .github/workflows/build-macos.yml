@@ -30,11 +30,14 @@ jobs:
 
           ls -la dist
 
-      - name: Unzip app
+      - name: Extract unsigned app
         run: |
           mkdir -p unsigned
-          unzip dist/*unsigned*.zip -d unsigned
-          find unsigned -name "*.app" -type d
+
+          ditto -x -k dist/*unsigned*.zip unsigned
+          rm -rf unsigned/__MACOSX
+
+          find unsigned -path "*/__MACOSX/*" -prune -o -name "*.app" -type d -print
 
       - name: Import Apple certificate
         env:
@@ -60,12 +63,14 @@ jobs:
         env:
           APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
         run: |
-          APP_PATH="$(find unsigned -name "*.app" -type d | head -n 1)"
+          APP_PATH="$(find unsigned -path "*/__MACOSX/*" -prune -o -name "*.app" -type d -print | head -n 1)"
 
           if [ -z "$APP_PATH" ]; then
             echo "No .app found"
             exit 1
           fi
+
+          echo "Signing app: $APP_PATH"
 
           codesign --force --deep --options runtime \
             --timestamp \
@@ -101,7 +106,7 @@ jobs:
 
       - name: Prepare app for notarization
         run: |
-          APP_PATH="$(find artifacts -name "*.app" -type d | head -n 1)"
+          APP_PATH="$(find artifacts -path "*/__MACOSX/*" -prune -o -name "*.app" -type d -print | head -n 1)"
 
           if [ -z "$APP_PATH" ]; then
             echo "No .app found"
@@ -110,7 +115,7 @@ jobs:
 
           echo "APP_PATH=$APP_PATH" >> "$GITHUB_ENV"
 
-          ditto -c -k --keepParent "$APP_PATH" app-notarize.zip
+          ditto -c -k --keepParent --norsrc --noextattr "$APP_PATH" app-notarize.zip
 
       - name: Notarize app
         env:
@@ -129,7 +134,7 @@ jobs:
 
       - name: Create final app zip
         run: |
-          ditto -c -k --keepParent "$APP_PATH" "HotPdfReader-macOS.app.zip"
+          ditto -c -k --keepParent --norsrc --noextattr "$APP_PATH" "HotPdfReader-macOS.app.zip"
 
       - name: Upload notarized app to GitHub Release
         uses: softprops/action-gh-release@v2
